@@ -253,7 +253,7 @@ impl PermissionPolicy {
                 }
                 if allow_rule.is_some()
                     || current_mode == PermissionMode::Allow
-                    || current_mode >= required_mode
+                    || (current_mode != PermissionMode::Prompt && current_mode >= required_mode)
                 {
                     return PermissionOutcome::Allow;
                 }
@@ -278,7 +278,7 @@ impl PermissionPolicy {
 
         if allow_rule.is_some()
             || current_mode == PermissionMode::Allow
-            || current_mode >= required_mode
+            || (current_mode != PermissionMode::Prompt && current_mode >= required_mode)
         {
             return PermissionOutcome::Allow;
         }
@@ -585,6 +585,71 @@ mod tests {
             policy.authorize("bash", "echo hi", Some(&mut prompter)),
             PermissionOutcome::Deny { reason } if reason == "not now"
         ));
+    }
+
+    #[test]
+    fn prompt_mode_routes_to_prompter_instead_of_auto_allowing() {
+        // Regression: `Prompt` sorts above `DangerFullAccess` in the
+        // `PermissionMode` `Ord` derivation, so the `current_mode >= required_mode`
+        // ladder check used to auto-allow every tool in `Prompt` mode and never
+        // invoke the prompter — defeating the entire purpose of the mode.
+        let policy = PermissionPolicy::new(PermissionMode::Prompt)
+            .with_tool_requirement("read_file", PermissionMode::ReadOnly);
+        let mut prompter = RecordingPrompter {
+            seen: Vec::new(),
+            allow: true,
+        };
+
+        let outcome = policy.authorize("read_file", "{}", Some(&mut prompter));
+
+        assert_eq!(outcome, PermissionOutcome::Allow);
+        assert_eq!(prompter.seen.len(), 1);
+        assert_eq!(prompter.seen[0].tool_name, "read_file");
+        assert_eq!(prompter.seen[0].current_mode, PermissionMode::Prompt);
+    }
+
+    #[test]
+    fn prompt_mode_denies_when_no_prompter_is_available() {
+        let policy = PermissionPolicy::new(PermissionMode::Prompt)
+            .with_tool_requirement("read_file", PermissionMode::ReadOnly);
+
+        assert!(matches!(
+            policy.authorize("read_file", "{}", None),
+            PermissionOutcome::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn prompt_mode_with_hook_allow_override_still_prompts() {
+        // Regression: `authorize_with_context` carries a second, identical copy of
+        // the ladder check inside the `Some(PermissionOverride::Allow)` arm. Without
+        // the same `Prompt` guard there, a hook emitting
+        // `permissionDecision: "allow"` (see `hooks.rs`) still auto-allowed every
+        // tool in `Prompt` mode — `Prompt` sorts above every required mode — and the
+        // prompter was never invoked, which is the behaviour this change set exists
+        // to prevent.
+        let policy = PermissionPolicy::new(PermissionMode::Prompt)
+            .with_tool_requirement("read_file", PermissionMode::ReadOnly);
+        let context = PermissionContext::new(
+            Some(PermissionOverride::Allow),
+            Some("hook approved".to_string()),
+        );
+        let mut prompter = RecordingPrompter {
+            seen: Vec::new(),
+            allow: true,
+        };
+
+        let outcome = policy.authorize_with_context(
+            "read_file",
+            "{}",
+            &context,
+            Some(&mut prompter),
+        );
+
+        assert_eq!(outcome, PermissionOutcome::Allow);
+        assert_eq!(prompter.seen.len(), 1);
+        assert_eq!(prompter.seen[0].tool_name, "read_file");
+        assert_eq!(prompter.seen[0].current_mode, PermissionMode::Prompt);
     }
 
     #[test]
