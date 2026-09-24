@@ -7,7 +7,9 @@ use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use mock_anthropic_service::{MockAnthropicService, CONTEXT_WINDOW_RETRY_TEXT, SCENARIO_PREFIX};
+use mock_anthropic_service::{
+    MockAnthropicService, CONTEXT_WINDOW_RETRY_TEXT, SCENARIO_PREFIX, STREAM_THEN_ERROR_TEXT,
+};
 use serde_json::Value;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -315,6 +317,68 @@ fn text_prompt_mode_emits_retried_body_once_after_auto_compact() {
     assert!(
         messages.len() >= 2,
         "the scenario should be requested twice so the retry is exercised ({captured:?})"
+    );
+
+    fs::remove_dir_all(&workspace).expect("workspace cleanup should succeed");
+}
+
+#[test]
+fn text_prompt_mode_keeps_streamed_text_when_the_turn_fails() {
+    // given a mock service that streams part of an answer and then fails the
+    // response, so the turn ends with text already rendered on the terminal
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+    let server = runtime
+        .block_on(MockAnthropicService::spawn())
+        .expect("mock service should start");
+    let base_url = server.base_url();
+
+    let workspace = unique_temp_dir("text-prompt-stream-then-error");
+    let config_home = workspace.join("config-home");
+    let home = workspace.join("home");
+    fs::create_dir_all(&workspace).expect("workspace should exist");
+    fs::create_dir_all(&config_home).expect("config home should exist");
+    fs::create_dir_all(&home).expect("home should exist");
+
+    // when the turn fails after the emitter already streamed a partial line
+    let prompt = format!("{SCENARIO_PREFIX}stream_then_error");
+    let output = run_claw(
+        &workspace,
+        &config_home,
+        &home,
+        &base_url,
+        &[
+            "--model",
+            "sonnet",
+            "--permission-mode",
+            "read-only",
+            &prompt,
+        ],
+    );
+
+    // then the failed turn is reported...
+    assert!(
+        !output.status.success(),
+        "a mid-stream failure should fail the run\nstdout:\n{}\n\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
+    let plain_stdout = strip_ansi_codes(&stdout);
+
+    // ...and the text the emitter already streamed survives the failure banner.
+    // `spinner.fail` moves to column 0 and clears the current line, so a caller
+    // that does not know a partial line is pending erases that text instead of
+    // printing the banner underneath it. This is the failure arm of the same
+    // ownership rule the success arm follows.
+    assert!(
+        plain_stdout
+            .lines()
+            .any(|line| line == STREAM_THEN_ERROR_TEXT),
+        "the streamed text should keep its own line despite the failure ({stdout:?})"
+    );
+    assert!(
+        plain_stdout.contains("Request failed"),
+        "the failure banner should still be reported ({stdout:?})"
     );
 
     fs::remove_dir_all(&workspace).expect("workspace cleanup should succeed");
