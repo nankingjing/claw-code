@@ -13,6 +13,11 @@ use tokio::task::JoinHandle;
 pub const SCENARIO_PREFIX: &str = "PARITY_SCENARIO:";
 pub const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
 
+/// The assistant text the `context_window_retry` scenario finally streams, after
+/// its first request was refused with a context-overflow error. Exposed so a
+/// test can assert on the exact body instead of restating the literal.
+pub const CONTEXT_WINDOW_RETRY_TEXT: &str = "auto compact retry parity complete.";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapturedRequest {
     pub method: String,
@@ -99,6 +104,7 @@ enum Scenario {
     BashPermissionPromptDenied,
     PluginToolRoundtrip,
     AutoCompactTriggered,
+    ContextWindowRetry,
     TokenCostReporting,
 }
 
@@ -116,6 +122,7 @@ impl Scenario {
             "bash_permission_prompt_denied" => Some(Self::BashPermissionPromptDenied),
             "plugin_tool_roundtrip" => Some(Self::PluginToolRoundtrip),
             "auto_compact_triggered" => Some(Self::AutoCompactTriggered),
+            "context_window_retry" => Some(Self::ContextWindowRetry),
             "token_cost_reporting" => Some(Self::TokenCostReporting),
             _ => None,
         }
@@ -134,6 +141,7 @@ impl Scenario {
             Self::BashPermissionPromptDenied => "bash_permission_prompt_denied",
             Self::PluginToolRoundtrip => "plugin_tool_roundtrip",
             Self::AutoCompactTriggered => "auto_compact_triggered",
+            Self::ContextWindowRetry => "context_window_retry",
             Self::TokenCostReporting => "token_cost_reporting",
         }
     }
@@ -149,6 +157,18 @@ async fn handle_connection(
     let scenario = detect_scenario(&request)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing parity scenario"))?;
 
+    // How many times this scenario has already been served *on this endpoint*.
+    // Scenarios that need to behave differently on a retry (reject once, then
+    // succeed) key off this; counting per endpoint keeps the token-counting
+    // preflight on `/v1/messages/count_tokens` from consuming the first attempt.
+    let attempt = {
+        let served = requests.lock().await;
+        served
+            .iter()
+            .filter(|captured| captured.scenario == scenario.name() && captured.path == path)
+            .count()
+    };
+
     requests.lock().await.push(CapturedRequest {
         method,
         path,
@@ -158,7 +178,7 @@ async fn handle_connection(
         raw_body,
     });
 
-    let response = build_http_response(&request, scenario);
+    let response = build_http_response(&request, scenario, attempt);
     socket.write_all(response.as_bytes()).await?;
     Ok(())
 }
@@ -308,7 +328,11 @@ fn flatten_tool_result_content(content: &[api::ToolResultContentBlock]) -> Strin
 }
 
 #[allow(clippy::too_many_lines)]
-fn build_http_response(request: &MessageRequest, scenario: Scenario) -> String {
+fn build_http_response(request: &MessageRequest, scenario: Scenario, attempt: usize) -> String {
+    if let Some(rejection) = context_window_rejection(scenario, attempt) {
+        return rejection;
+    }
+
     let response = if request.stream {
         let body = build_stream_body(request, scenario);
         return http_response(
@@ -327,6 +351,37 @@ fn build_http_response(request: &MessageRequest, scenario: Scenario) -> String {
         &serde_json::to_string(&response).expect("message response should serialize"),
         &[("request-id", request_id_for(scenario))],
     )
+}
+
+/// The first request of [`Scenario::ContextWindowRetry`] is refused with a
+/// context-overflow error instead of a streamed answer, so the client's
+/// auto-compact recovery path runs and the *retry* is what produces the
+/// response text. Every later request against the same endpoint succeeds.
+///
+/// HTTP 400 is deliberately chosen: it is not in the client's retryable status
+/// set, so the client surfaces the error rather than silently re-sending it —
+/// which is exactly the situation a real context-overflow rejection creates.
+/// The body carries the `context_window` marker the client greps for.
+fn context_window_rejection(scenario: Scenario, attempt: usize) -> Option<String> {
+    if scenario != Scenario::ContextWindowRetry || attempt > 0 {
+        return None;
+    }
+
+    let body = json!({
+        "type": "error",
+        "error": {
+            "type": "invalid_request_error",
+            "message": "prompt is too long: context_window exceeded for this model",
+        },
+    })
+    .to_string();
+
+    Some(http_response(
+        "400 Bad Request",
+        "application/json",
+        &body,
+        &[("request-id", request_id_for(scenario))],
+    ))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -461,6 +516,7 @@ fn build_stream_body(request: &MessageRequest, scenario: Scenario) -> String {
         Scenario::AutoCompactTriggered => {
             final_text_sse_with_usage("auto compact parity complete.", 50_000, 200)
         }
+        Scenario::ContextWindowRetry => final_text_sse(CONTEXT_WINDOW_RETRY_TEXT),
         Scenario::TokenCostReporting => {
             final_text_sse_with_usage("token cost reporting parity complete.", 1_000, 500)
         }
@@ -628,6 +684,9 @@ fn build_message_response(request: &MessageRequest, scenario: Scenario) -> Messa
             50_000,
             200,
         ),
+        Scenario::ContextWindowRetry => {
+            text_message_response("msg_context_window_retry", CONTEXT_WINDOW_RETRY_TEXT)
+        }
         Scenario::TokenCostReporting => text_message_response_with_usage(
             "msg_token_cost_reporting",
             "token cost reporting parity complete.",
@@ -650,6 +709,7 @@ fn request_id_for(scenario: Scenario) -> &'static str {
         Scenario::BashPermissionPromptDenied => "req_bash_permission_prompt_denied",
         Scenario::PluginToolRoundtrip => "req_plugin_tool_roundtrip",
         Scenario::AutoCompactTriggered => "req_auto_compact_triggered",
+        Scenario::ContextWindowRetry => "req_context_window_retry",
         Scenario::TokenCostReporting => "req_token_cost_reporting",
     }
 }
