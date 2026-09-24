@@ -27,6 +27,7 @@ use std::net::TcpListener;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
@@ -7642,6 +7643,7 @@ impl LiveCli {
             system_prompt.clone(),
             enable_tools,
             true,
+            TerminalTail::new(),
             allowed_tools.clone(),
             permission_mode,
             None,
@@ -7723,6 +7725,7 @@ impl LiveCli {
     fn prepare_turn_runtime(
         &self,
         emit_output: bool,
+        terminal_tail: TerminalTail,
     ) -> Result<(BuiltRuntime, HookAbortMonitor), Box<dyn std::error::Error>> {
         let hook_abort_signal = runtime::HookAbortSignal::new();
         let runtime = build_runtime(
@@ -7732,6 +7735,7 @@ impl LiveCli {
             self.system_prompt.clone(),
             true,
             emit_output,
+            terminal_tail,
             self.allowed_tools.clone(),
             self.permission_mode,
             None,
@@ -7749,27 +7753,39 @@ impl LiveCli {
     }
 
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(true)?;
+        let terminal_tail = TerminalTail::new();
+        let (mut runtime, hook_abort_monitor) =
+            self.prepare_turn_runtime(true, terminal_tail.clone())?;
         let mut spinner = Spinner::new();
         let mut stdout = io::stdout();
-        spinner.tick(
-            "🦀 Thinking...",
-            TerminalRenderer::new().color_theme(),
-            &mut stdout,
-        )?;
+        // The animated frame is cursor control: it saves the cursor, rewrites the
+        // current line, and restores the cursor. None of that describes anything
+        // when stdout is a pipe — the escapes survive as literal bytes and the
+        // banner ends up glued to whatever the emitter writes next. Only animate
+        // on a terminal; the one-shot completion line below is plain text and is
+        // emitted either way.
+        if io::stdout().is_terminal() {
+            spinner.tick(
+                "🦀 Thinking...",
+                TerminalRenderer::new().color_theme(),
+                &mut stdout,
+            )?;
+        }
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
         match result {
             Ok(summary) => {
                 self.replace_runtime(runtime)?;
-                // The assistant response was already streamed to the terminal live
-                // during the turn (emit_output = true), so reprinting the full text
-                // here would duplicate the entire message. When text was streamed,
-                // emit a newline first so `spinner.finish`'s line-clear lands on a
-                // fresh line instead of erasing the last streamed line.
-                let final_text = final_assistant_text(&summary);
-                if !final_text.is_empty() {
+                // The emitter owns the terminal during a turn: `emit_output = true`
+                // streams text deltas and echoes tool results live, so the response
+                // must not be printed again here — that was the duplicate output
+                // this PR's predecessor fixed.
+                //
+                // What the emitter may have left behind is a partial line, so ask it
+                // rather than guessing from `final_assistant_text(&summary)`: that
+                // guess is empty for tool-only turns, which still render.
+                if !terminal_tail.at_line_start() {
                     println!();
                 }
                 spinner.finish(
@@ -7789,6 +7805,13 @@ impl LiveCli {
             }
             Err(error) => {
                 runtime.shutdown_plugins()?;
+                // Same ownership rule as the success arm: `fail` clears the current
+                // line, so it may only do so when the emitter stopped on a line
+                // boundary. A turn that streamed text and then failed would
+                // otherwise lose its last partial line to the clear.
+                if !terminal_tail.at_line_start() {
+                    println!();
+                }
                 spinner.fail(
                     "❌ Request failed",
                     TerminalRenderer::new().color_theme(),
@@ -7901,14 +7924,14 @@ impl LiveCli {
 
                         // Build a new runtime with the compacted session and retry
                         let (mut new_runtime, hook_abort_monitor) =
-                            self.prepare_turn_runtime(true)?;
+                            self.prepare_turn_runtime(true, terminal_tail.clone())?;
                         drop(hook_abort_monitor);
 
                         let mut rp = CliPermissionPrompter::new(self.permission_mode);
                         match new_runtime.run_turn(input, Some(&mut rp)) {
                             Ok(summary) => {
                                 self.replace_runtime(new_runtime)?;
-                                if !final_assistant_text(&summary).is_empty() {
+                                if !terminal_tail.at_line_start() {
                                     println!();
                                 }
                                 spinner.finish(
@@ -7993,7 +8016,8 @@ impl LiveCli {
     }
 
     fn run_prompt_compact(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false)?;
+        let (mut runtime, hook_abort_monitor) =
+            self.prepare_turn_runtime(false, TerminalTail::new())?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
@@ -8006,7 +8030,8 @@ impl LiveCli {
     }
 
     fn run_prompt_compact_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false)?;
+        let (mut runtime, hook_abort_monitor) =
+            self.prepare_turn_runtime(false, TerminalTail::new())?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
@@ -8031,7 +8056,8 @@ impl LiveCli {
     }
 
     fn run_prompt_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false)?;
+        let (mut runtime, hook_abort_monitor) =
+            self.prepare_turn_runtime(false, TerminalTail::new())?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
@@ -8387,6 +8413,7 @@ impl LiveCli {
             self.system_prompt.clone(),
             true,
             true,
+            TerminalTail::new(),
             self.allowed_tools.clone(),
             self.permission_mode,
             None,
@@ -8433,6 +8460,7 @@ impl LiveCli {
             self.system_prompt.clone(),
             true,
             true,
+            TerminalTail::new(),
             self.allowed_tools.clone(),
             self.permission_mode,
             None,
@@ -8463,6 +8491,7 @@ impl LiveCli {
             self.system_prompt.clone(),
             true,
             true,
+            TerminalTail::new(),
             self.allowed_tools.clone(),
             self.permission_mode,
             None,
@@ -8505,6 +8534,7 @@ impl LiveCli {
             self.system_prompt.clone(),
             true,
             true,
+            TerminalTail::new(),
             self.allowed_tools.clone(),
             self.permission_mode,
             None,
@@ -8858,6 +8888,7 @@ impl LiveCli {
                     self.system_prompt.clone(),
                     true,
                     true,
+                    TerminalTail::new(),
                     self.allowed_tools.clone(),
                     self.permission_mode,
                     None,
@@ -8893,6 +8924,7 @@ impl LiveCli {
                     self.system_prompt.clone(),
                     true,
                     true,
+                    TerminalTail::new(),
                     self.allowed_tools.clone(),
                     self.permission_mode,
                     None,
@@ -8987,6 +9019,7 @@ impl LiveCli {
             self.system_prompt.clone(),
             true,
             true,
+            TerminalTail::new(),
             self.allowed_tools.clone(),
             self.permission_mode,
             None,
@@ -9007,6 +9040,7 @@ impl LiveCli {
             self.system_prompt.clone(),
             true,
             true,
+            TerminalTail::new(),
             self.allowed_tools.clone(),
             self.permission_mode,
             None,
@@ -9031,6 +9065,7 @@ impl LiveCli {
             self.system_prompt.clone(),
             enable_tools,
             false,
+            TerminalTail::new(),
             self.allowed_tools.clone(),
             self.permission_mode,
             progress,
@@ -12378,6 +12413,7 @@ fn build_runtime(
     system_prompt: Vec<String>,
     enable_tools: bool,
     emit_output: bool,
+    terminal_tail: TerminalTail,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
     progress_reporter: Option<InternalPromptProgressReporter>,
@@ -12390,6 +12426,7 @@ fn build_runtime(
         system_prompt,
         enable_tools,
         emit_output,
+        terminal_tail,
         allowed_tools,
         permission_mode,
         progress_reporter,
@@ -12406,6 +12443,7 @@ fn build_runtime_with_plugin_state(
     system_prompt: Vec<String>,
     enable_tools: bool,
     emit_output: bool,
+    terminal_tail: TerminalTail,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
     progress_reporter: Option<InternalPromptProgressReporter>,
@@ -12431,6 +12469,7 @@ fn build_runtime_with_plugin_state(
             model,
             enable_tools,
             emit_output,
+            terminal_tail.clone(),
             allowed_tools.clone(),
             tool_registry.clone(),
             progress_reporter,
@@ -12438,6 +12477,7 @@ fn build_runtime_with_plugin_state(
         CliToolExecutor::new(
             allowed_tools.clone(),
             emit_output,
+            terminal_tail,
             tool_registry.clone(),
             mcp_state.clone(),
         ),
@@ -12533,6 +12573,76 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
     }
 }
 
+/// Tracks whether the shared terminal stream currently sits at the start of a
+/// fresh line.
+///
+/// A turn's streamed assistant text has no trailing newline, and
+/// `Spinner::finish` moves to column 0 and clears the current line — so without
+/// a guard it erases the last thing the emitter rendered. Both writers that
+/// render live during a turn (the assistant/reasoning deltas in
+/// `AnthropicRuntimeClient::consume_stream` and the tool-result blocks in
+/// `CliToolExecutor::execute`) push their bytes
+/// through a `TailTrackingWriter` sharing one of these, which lets the caller
+/// that ends the turn ask the emitter what it actually left on the terminal.
+///
+/// The previous approach inferred this from `final_assistant_text(&summary)`,
+/// which agrees today only because every *other* writer terminates its output
+/// with a newline — tool results go through `stream_markdown` (which appends
+/// one), thinking summaries are written with a trailing newline, and tool-call
+/// headers use `writeln!`. That is a property of the current renderers rather
+/// than of the streaming protocol, and the text path already violates it, so
+/// recording the fact is cheaper than depending on it. The heuristic also left
+/// the failure arm unguarded: a turn that streamed text and then errored still
+/// had that line cleared.
+#[derive(Clone, Default)]
+struct TerminalTail {
+    at_line_start: Arc<AtomicBool>,
+}
+
+impl TerminalTail {
+    fn new() -> Self {
+        Self {
+            at_line_start: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    /// True when nothing has been written since the last newline, so clearing
+    /// the current terminal line cannot destroy rendered output.
+    fn at_line_start(&self) -> bool {
+        self.at_line_start.load(Ordering::Relaxed)
+    }
+
+    fn record(&self, written: &[u8]) {
+        if let Some(last) = written.last() {
+            self.at_line_start.store(*last == b'\n', Ordering::Relaxed);
+        }
+    }
+}
+
+/// Forwards writes to `inner` while reporting the tail byte to a `TerminalTail`.
+struct TailTrackingWriter<'a, W: Write> {
+    inner: &'a mut W,
+    tail: TerminalTail,
+}
+
+impl<'a, W: Write> TailTrackingWriter<'a, W> {
+    fn new(inner: &'a mut W, tail: TerminalTail) -> Self {
+        Self { inner, tail }
+    }
+}
+
+impl<W: Write> Write for TailTrackingWriter<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        self.tail.record(&buf[..written]);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 // NOTE: Despite the historical name `AnthropicRuntimeClient`, this struct
 // now holds an `ApiProviderClient` which dispatches to Anthropic, xAI,
 // OpenAI, or DashScope at construction time based on
@@ -12546,6 +12656,7 @@ struct AnthropicRuntimeClient {
     model: String,
     enable_tools: bool,
     emit_output: bool,
+    terminal_tail: TerminalTail,
     allowed_tools: Option<AllowedToolSet>,
     tool_registry: GlobalToolRegistry,
     progress_reporter: Option<InternalPromptProgressReporter>,
@@ -12558,6 +12669,7 @@ impl AnthropicRuntimeClient {
         model: String,
         enable_tools: bool,
         emit_output: bool,
+        terminal_tail: TerminalTail,
         allowed_tools: Option<AllowedToolSet>,
         tool_registry: GlobalToolRegistry,
         progress_reporter: Option<InternalPromptProgressReporter>,
@@ -12611,6 +12723,7 @@ impl AnthropicRuntimeClient {
             model,
             enable_tools,
             emit_output,
+            terminal_tail,
             allowed_tools,
             tool_registry,
             progress_reporter,
@@ -12700,8 +12813,9 @@ impl AnthropicRuntimeClient {
             })?;
         let mut stdout = io::stdout();
         let mut sink = io::sink();
+        let mut tracked = TailTrackingWriter::new(&mut stdout, self.terminal_tail.clone());
         let out: &mut dyn Write = if self.emit_output {
-            &mut stdout
+            &mut tracked
         } else {
             &mut sink
         };
@@ -13865,6 +13979,7 @@ fn prompt_cache_record_to_runtime_event(
 struct CliToolExecutor {
     renderer: TerminalRenderer,
     emit_output: bool,
+    terminal_tail: TerminalTail,
     allowed_tools: Option<AllowedToolSet>,
     tool_registry: GlobalToolRegistry,
     mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
@@ -13874,12 +13989,14 @@ impl CliToolExecutor {
     fn new(
         allowed_tools: Option<AllowedToolSet>,
         emit_output: bool,
+        terminal_tail: TerminalTail,
         tool_registry: GlobalToolRegistry,
         mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
     ) -> Self {
         Self {
             renderer: TerminalRenderer::new(),
             emit_output,
+            terminal_tail,
             allowed_tools,
             tool_registry,
             mcp_state,
@@ -13973,8 +14090,11 @@ impl ToolExecutor for CliToolExecutor {
             Ok(output) => {
                 if self.emit_output {
                     let markdown = format_tool_result(tool_name, &output, false);
+                    let mut stdout = io::stdout();
+                    let mut tracked =
+                        TailTrackingWriter::new(&mut stdout, self.terminal_tail.clone());
                     self.renderer
-                        .stream_markdown(&markdown, &mut io::stdout())
+                        .stream_markdown(&markdown, &mut tracked)
                         .map_err(|error| ToolError::new(error.to_string()))?;
                 }
                 Ok(output)
@@ -13982,8 +14102,11 @@ impl ToolExecutor for CliToolExecutor {
             Err(error) => {
                 if self.emit_output {
                     let markdown = format_tool_result(tool_name, &error.to_string(), true);
+                    let mut stdout = io::stdout();
+                    let mut tracked =
+                        TailTrackingWriter::new(&mut stdout, self.terminal_tail.clone());
                     self.renderer
-                        .stream_markdown(&markdown, &mut io::stdout())
+                        .stream_markdown(&markdown, &mut tracked)
                         .map_err(|stream_error| ToolError::new(stream_error.to_string()))?;
                 }
                 Err(error)
@@ -14298,8 +14421,8 @@ mod tests {
         CliOutputFormat, CliToolExecutor, GitOperation, GitWorkspaceSummary,
         InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
         PermissionModeProvenance, PromptHistoryEntry, SessionLifecycleKind,
-        SessionLifecycleSummary, SlashCommand, StatusUsage, TmuxPaneSnapshot, DEFAULT_MODEL,
-        LATEST_SESSION_REFERENCE, STUB_COMMANDS,
+        SessionLifecycleSummary, SlashCommand, StatusUsage, TerminalTail, TmuxPaneSnapshot,
+        DEFAULT_MODEL, LATEST_SESSION_REFERENCE, STUB_COMMANDS,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
@@ -19222,6 +19345,7 @@ UU conflicted.rs",
         let mut executor = CliToolExecutor::new(
             None,
             false,
+            TerminalTail::new(),
             state.tool_registry.clone(),
             state.mcp_state.clone(),
         );
@@ -19320,6 +19444,7 @@ UU conflicted.rs",
         let mut executor = CliToolExecutor::new(
             None,
             false,
+            TerminalTail::new(),
             state.tool_registry.clone(),
             state.mcp_state.clone(),
         );
@@ -19380,6 +19505,7 @@ UU conflicted.rs",
             vec!["test system prompt".to_string()],
             true,
             false,
+            TerminalTail::new(),
             None,
             PermissionMode::DangerFullAccess,
             None,
