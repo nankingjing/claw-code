@@ -113,7 +113,10 @@ Primary artifacts:
 Short model aliases resolve to canonical model IDs. Because the router selects a
 provider from the resolved model, an alias also determines which backend and
 credentials are used — choose the alias for the provider you have an API key for.
-Alias resolution is case-insensitive (`OPUS` behaves the same as `opus`).
+Alias resolution is case-insensitive (`OPUS` behaves the same as `opus`). Aliases
+are the bare short names listed below: a prefixed form such as `anthropic/opus`
+is not an alias, and is passed through as-is rather than expanded to
+`claude-opus-4-7`.
 
 | Alias | Resolves To | Provider | Auth env var |
 |-------|-------------|----------|--------------|
