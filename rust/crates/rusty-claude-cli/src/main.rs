@@ -4222,15 +4222,18 @@ fn check_permission_health(permission_mode: PermissionModeProvenance) -> Diagnos
         || source.to_string(),
         |env_var| format!("{source}:{env_var}"),
     );
+    // Ranks, not declaration order: `PermissionMode` deliberately does not
+    // derive `Ord`, so the ladder is named at every comparison site.
     let specs = mvp_tool_specs();
+    let active_rank = permission_mode.mode.privilege_rank();
     let tools_satisfied = specs
         .iter()
-        .filter(|spec| permission_mode.mode >= spec.required_permission)
+        .filter(|spec| active_rank >= spec.required_permission.privilege_rank())
         .map(|spec| spec.name)
         .collect::<Vec<_>>();
     let tools_gated = specs
         .iter()
-        .filter(|spec| permission_mode.mode < spec.required_permission)
+        .filter(|spec| active_rank < spec.required_permission.privilege_rank())
         .map(|spec| spec.name)
         .collect::<Vec<_>>();
 
