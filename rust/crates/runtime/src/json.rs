@@ -355,4 +355,120 @@ mod tests {
     fn escapes_control_characters() {
         assert_eq!(render_string("a\n\t\"b"), "\"a\\n\\t\\\"b\"");
     }
+
+    #[test]
+    fn parses_escape_sequences_inside_strings() {
+        // Short escapes must decode to the control character they name rather
+        // than to the literal letter that follows the backslash.
+        assert_eq!(
+            JsonValue::parse("\"a\\nb\"").expect("newline escape parses"),
+            JsonValue::String("a\nb".to_string())
+        );
+        assert_eq!(
+            JsonValue::parse("\"a\\tb\"").expect("tab escape parses"),
+            JsonValue::String("a\tb".to_string())
+        );
+        assert_eq!(
+            JsonValue::parse("\"\\r\\b\\f\"").expect("control escapes parse"),
+            JsonValue::String("\r\u{08}\u{0C}".to_string())
+        );
+        // JSON allows a forward slash to be escaped even though it need not be.
+        assert_eq!(
+            JsonValue::parse("\"a\\/b\"").expect("escaped slash parses"),
+            JsonValue::String("a/b".to_string())
+        );
+        // An escaped quote must not terminate the string, and an escaped
+        // backslash must not start another escape sequence.
+        assert_eq!(
+            JsonValue::parse("\"\\\"\\\\\"").expect("escaped quote and backslash parse"),
+            JsonValue::String("\"\\".to_string())
+        );
+    }
+
+    #[test]
+    fn parses_four_digit_unicode_escapes() {
+        // All four hex digits belong to the escape: stopping after three would
+        // leave the fourth as a literal character.
+        assert_eq!(
+            JsonValue::parse("\"\\u0041\"").expect("four digit escape parses"),
+            JsonValue::String("A".to_string())
+        );
+        // Hex digits are accepted in either case.
+        assert_eq!(
+            JsonValue::parse("\"\\u00E9\"").expect("uppercase hex digits parse"),
+            JsonValue::String("\u{e9}".to_string())
+        );
+        assert_eq!(
+            JsonValue::parse("\"\\u00e9\"").expect("lowercase hex digits parse"),
+            JsonValue::String("\u{e9}".to_string())
+        );
+        // Fewer than four hex digits is not a unicode escape.
+        assert!(JsonValue::parse("\"\\u00e\"").is_err(), "three hex digits");
+        assert!(JsonValue::parse("\"\\uZZZZ\"").is_err(), "non hex digits");
+        // A surrogate is not a unicode scalar value, so it cannot be a char.
+        assert!(JsonValue::parse("\"\\ud800\"").is_err(), "lone surrogate");
+    }
+
+    #[test]
+    fn round_trips_parsed_escapes_through_the_renderer() {
+        // Every escape that parses must render back to JSON that re-parses to
+        // the same value. The renderer may pick an equivalent spelling (for
+        // example \u000a instead of \n), so only the round trip is asserted.
+        for source in [
+            "\"a\\nb\"",
+            "\"a\\tb\"",
+            "\"a\\/b\"",
+            "\"\\r\\b\\f\"",
+            "\"\\\"\\\\\"",
+            "\"\\u0041\"",
+            "\"\\u00E9\"",
+        ] {
+            let parsed = JsonValue::parse(source).expect("escaped source parses");
+            let reparsed = JsonValue::parse(&parsed.render()).expect("rendered value re-parses");
+            assert_eq!(reparsed, parsed, "round trip changed {source}");
+        }
+
+        // Object keys are escaped on the way out and unescaped on the way in.
+        let mut object = BTreeMap::new();
+        object.insert("a\nb".to_string(), JsonValue::String("c\td".to_string()));
+        let original = JsonValue::Object(object);
+        let reparsed = JsonValue::parse(&original.render()).expect("escaped key re-parses");
+        assert_eq!(reparsed, original);
+    }
+
+    #[test]
+    fn parses_the_i64_boundary_and_rejects_the_values_past_it() {
+        // i64::MAX and i64::MIN are representable, so they must parse to the
+        // exact value rather than being narrowed or clamped.
+        assert_eq!(
+            JsonValue::parse("9223372036854775807")
+                .expect("i64::MAX parses")
+                .as_i64(),
+            Some(i64::MAX)
+        );
+        assert_eq!(
+            JsonValue::parse("-9223372036854775808")
+                .expect("i64::MIN parses")
+                .as_i64(),
+            Some(i64::MIN)
+        );
+        assert_eq!(
+            JsonValue::parse("-9223372036854775807")
+                .expect("i64::MIN + 1 parses")
+                .as_i64(),
+            Some(i64::MIN + 1)
+        );
+
+        // One past either end of the range must be rejected. This is what pins
+        // the accepted range at i64: a rejection test built from an obviously
+        // huge number is also satisfied by a much narrower integer type.
+        assert!(
+            JsonValue::parse("9223372036854775808").is_err(),
+            "i64::MAX + 1"
+        );
+        assert!(
+            JsonValue::parse("-9223372036854775809").is_err(),
+            "i64::MIN - 1"
+        );
+    }
 }
