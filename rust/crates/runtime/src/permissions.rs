@@ -639,12 +639,8 @@ mod tests {
             allow: true,
         };
 
-        let outcome = policy.authorize_with_context(
-            "read_file",
-            "{}",
-            &context,
-            Some(&mut prompter),
-        );
+        let outcome =
+            policy.authorize_with_context("read_file", "{}", &context, Some(&mut prompter));
 
         assert_eq!(outcome, PermissionOutcome::Allow);
         assert_eq!(prompter.seen.len(), 1);
